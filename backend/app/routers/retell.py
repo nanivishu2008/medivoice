@@ -2,7 +2,8 @@ import os
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+import httpx
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from ..database import get_db
@@ -12,7 +13,7 @@ router = APIRouter(prefix="/api/retell", tags=["Retell Voice AI Integration"])
 
 
 # ==========================================
-# Schemas
+# Request & Response Schemas
 # ==========================================
 class RetellAvailabilityRequest(BaseModel):
     specialty: Optional[str] = Field(None, description="Requested specialty (e.g. Cardiology, Dermatology)")
@@ -32,7 +33,7 @@ class RetellLookupRequest(BaseModel):
 
 
 class RetellConversationState(BaseModel):
-    step: str = "COLLECT_SPECIALTY"  # COLLECT_SPECIALTY, SELECT_SLOT, COLLECT_NAME, COLLECT_CONTACT, COMPLETED
+    step: str = "COLLECT_SPECIALTY"
     specialty: Optional[str] = None
     doctor_id: Optional[int] = None
     doctor_name: Optional[str] = None
@@ -49,6 +50,7 @@ class RetellChatRequest(BaseModel):
     user_message: str
     state: Optional[RetellConversationState] = None
     history: Optional[List[Dict[str, str]]] = None
+    api_key: Optional[str] = None
 
 
 class RetellChatResponse(BaseModel):
@@ -56,10 +58,11 @@ class RetellChatResponse(BaseModel):
     next_state: RetellConversationState
     available_slots: Optional[List[Dict[str, Any]]] = None
     booking_reference: Optional[str] = None
+    powered_by: str = "built-in"  # "gemini" or "built-in"
 
 
 # ==========================================
-# 1. Voice AI Custom Function: Check Availability
+# 1. Voice AI Custom Functions for Retell
 # ==========================================
 @router.post("/check-availability")
 def retell_check_availability(
@@ -114,9 +117,6 @@ def retell_check_availability(
     }
 
 
-# ==========================================
-# 2. Voice AI Custom Function: Book Appointment
-# ==========================================
 @router.post("/book-appointment")
 def retell_book_appointment(
     payload: RetellBookRequest,
@@ -152,9 +152,6 @@ def retell_book_appointment(
     }
 
 
-# ==========================================
-# 3. Voice AI Custom Function: Lookup Booking
-# ==========================================
 @router.post("/lookup-booking")
 def retell_lookup_booking(
     payload: RetellLookupRequest,
@@ -183,7 +180,227 @@ def retell_lookup_booking(
 
 
 # ==========================================
-# Helper: Conversational Entity & Intent Extraction
+# Gemini LLM Integration with Function Calling
+# ==========================================
+GEMINI_TOOLS = [
+    {
+        "function_declarations": [
+            {
+                "name": "get_doctors",
+                "description": "List registered doctors and their medical specialties, qualifications, and bios.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "specialty": {"type": "STRING", "description": "Optional specialty filter"}
+                    }
+                }
+            },
+            {
+                "name": "get_available_slots",
+                "description": "Query available upcoming unbooked appointment slots for a doctor or specialty.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "doctor_id": {"type": "INTEGER", "description": "Doctor ID"},
+                        "specialty": {"type": "STRING", "description": "Specialty name"}
+                    }
+                }
+            },
+            {
+                "name": "book_appointment",
+                "description": "Atomically books an appointment slot in the database for the patient.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "slot_id": {"type": "INTEGER", "description": "Slot ID to reserve"},
+                        "patient_name": {"type": "STRING", "description": "Patient's full legal name"},
+                        "patient_phone": {"type": "STRING", "description": "Contact phone number"},
+                        "patient_email": {"type": "STRING", "description": "Email address for confirmation"},
+                        "reason_for_visit": {"type": "STRING", "description": "Symptoms or reason for visit"}
+                    },
+                    "required": ["slot_id", "patient_name", "patient_phone", "patient_email"]
+                }
+            },
+            {
+                "name": "lookup_booking",
+                "description": "Look up an existing appointment by reference code.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "reference_code": {"type": "STRING", "description": "Reference code (e.g. MV-4A7F2B)"}
+                    },
+                    "required": ["reference_code"]
+                }
+            }
+        ]
+    }
+]
+
+
+def execute_gemini_tool(func_name: str, args: Dict[str, Any], db: Session) -> Dict[str, Any]:
+    if func_name == "get_doctors":
+        docs = crud.get_doctors(db, specialty=args.get("specialty"))
+        return {
+            "doctors": [
+                {"id": d.id, "name": d.name, "specialty": d.specialty, "qualification": d.qualification, "bio": d.bio}
+                for d in docs
+            ]
+        }
+    elif func_name == "get_available_slots":
+        slots = crud.get_available_slots(db, doctor_id=args.get("doctor_id"))
+        spec = args.get("specialty")
+        if spec:
+            slots = [s for s in slots if s.doctor and spec.lower() in s.doctor.specialty.lower()]
+        return {
+            "slots": [
+                {
+                    "slot_id": s.id,
+                    "doctor_name": s.doctor.name if s.doctor else "Doctor",
+                    "specialty": s.doctor.specialty if s.doctor else "General",
+                    "formatted_time": s.start_time.strftime("%A, %B %d at %I:%M %p")
+                }
+                for s in slots[:5]
+            ]
+        }
+    elif func_name == "book_appointment":
+        try:
+            booking_in = schemas.BookingCreateRequest(
+                slot_id=args["slot_id"],
+                patient_name=args["patient_name"],
+                patient_phone=args["patient_phone"],
+                patient_email=args["patient_email"],
+                reason_for_visit=args.get("reason_for_visit")
+            )
+            b = crud.create_booking(db, booking_in)
+            return {
+                "success": True,
+                "booking_id": b.id,
+                "reference_code": b.reference_code,
+                "patient_name": b.patient_name,
+                "appointment_time": b.slot.start_time.strftime("%A, %B %d at %I:%M %p"),
+                "doctor_name": b.slot.doctor.name if b.slot and b.slot.doctor else "Doctor"
+            }
+        except HTTPException as he:
+            return {"success": False, "error": he.detail}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif func_name == "lookup_booking":
+        b = crud.get_booking_by_reference(db, reference_code=args["reference_code"])
+        if not b:
+            return {"found": False}
+        return {
+            "found": True,
+            "reference_code": b.reference_code,
+            "patient_name": b.patient_name,
+            "status": b.status,
+            "appointment_time": b.slot.start_time.strftime("%A, %B %d at %I:%M %p"),
+            "doctor_name": b.slot.doctor.name if b.slot and b.slot.doctor else "Doctor"
+        }
+    return {"error": f"Unknown tool {func_name}"}
+
+
+async def call_gemini_api(
+    user_msg: str,
+    history: List[Dict[str, str]],
+    api_key: str,
+    db: Session
+) -> Optional[Dict[str, Any]]:
+    """Calls Google Gemini with multi-turn chat history and database tools."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+
+    # Build contents from history
+    contents = []
+    for h in (history or []):
+        role = "user" if h.get("role") == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": h.get("content", "")}]})
+    contents.append({"role": "user", "parts": [{"text": user_msg}]})
+
+    system_text = (
+        "You are MediVoice AI, a warm, professional healthcare appointment scheduling voice assistant. "
+        "You are conversing with a patient. "
+        "Guidelines:\n"
+        "1. Have a natural, empathetic conversation like an expert medical receptionist.\n"
+        "2. REMEMBER every detail the patient provides throughout the chat (name, symptoms, doctor, times, phone, email).\n"
+        "3. Never ask for information the patient already provided.\n"
+        "4. Use your tools (get_doctors, get_available_slots, book_appointment) to check real availability and book slots.\n"
+        "5. When scheduling: gather (specialty or doctor preference), then present open slots, get patient choice, then gather full name, phone number, and email. When all are present, immediately call 'book_appointment'.\n"
+        "6. Keep spoken responses concise and friendly (2-3 sentences), ideal for voice playback."
+    )
+
+    payload = {
+        "system_instruction": {"parts": [{"text": system_text}]},
+        "contents": contents,
+        "tools": GEMINI_TOOLS
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code != 200:
+                print("Gemini API error:", resp.status_code, resp.text)
+                return None
+
+            data = resp.json()
+            candidate = data.get("candidates", [{}])[0]
+            content = candidate.get("content", {})
+            parts = content.get("parts", [])
+
+            # Check if Gemini called a tool
+            tool_call = None
+            text_reply = ""
+            for p in parts:
+                if "functionCall" in p:
+                    tool_call = p["functionCall"]
+                elif "text" in p:
+                    text_reply += p["text"]
+
+            booking_ref = None
+            if tool_call:
+                tool_name = tool_call.get("name")
+                tool_args = tool_call.get("args", {})
+                tool_result = execute_gemini_tool(tool_name, tool_args, db)
+
+                if tool_name == "book_appointment" and tool_result.get("success"):
+                    booking_ref = tool_result.get("reference_code")
+
+                # Send tool result back to Gemini for final spoken response
+                contents.append(content)
+                contents.append({
+                    "role": "function",
+                    "parts": [{"functionResponse": {"name": tool_name, "response": tool_result}}]
+                })
+
+                followup_payload = {
+                    "system_instruction": {"parts": [{"text": system_text}]},
+                    "contents": contents,
+                    "tools": GEMINI_TOOLS
+                }
+                followup_resp = await client.post(url, json=followup_payload)
+                if followup_resp.status_code == 200:
+                    f_data = followup_resp.json()
+                    f_cand = f_data.get("candidates", [{}])[0]
+                    f_parts = f_cand.get("content", {}).get("parts", [])
+                    final_text = "".join([p.get("text", "") for p in f_parts])
+                    return {
+                        "text": final_text or text_reply,
+                        "booking_reference": booking_ref
+                    }
+
+            if text_reply:
+                return {
+                    "text": text_reply,
+                    "booking_reference": booking_ref
+                }
+
+    except Exception as e:
+        print("Gemini call failed:", str(e))
+        return None
+
+    return None
+
+
+# ==========================================
+# Built-in Conversational Memory & Extraction Engine
 # ==========================================
 def extract_email(text: str) -> Optional[str]:
     m = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)
@@ -191,7 +408,6 @@ def extract_email(text: str) -> Optional[str]:
 
 
 def extract_phone(text: str) -> Optional[str]:
-    # Match standard local, US, or international formats (e.g. 555-4321, (555) 123-4567, +1-555...)
     m = re.search(r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3}[-.\s]?\d{3,4}|\b\d{7,15}\b", text)
     if m:
         return m.group(0).strip()
@@ -204,24 +420,20 @@ def extract_phone(text: str) -> Optional[str]:
 def extract_name(text: str, current_name: Optional[str] = None) -> Optional[str]:
     if current_name:
         return current_name
-
     lower = text.lower()
     for trigger in ["my name is", "i am", "name is", "call me", "this is"]:
         if trigger in lower:
             idx = lower.find(trigger) + len(trigger)
             raw = text[idx:].strip()
-            # Clean punctuation and extra words
-            cleaned = re.split(r"[,.!?\n]|and |phone|email|my phone", raw, flags=re.IGNORECASE)[0].strip()
+            cleaned = re.split(r"[,.!?\n]|and |phone|email", raw, flags=re.IGNORECASE)[0].strip()
             if len(cleaned) >= 2:
                 return cleaned.title()
 
-    # If the message looks like just a 2-3 word name
     words = text.strip().split()
     if 2 <= len(words) <= 3 and all(w.isalpha() for w in words):
         stopwords = {"hello", "hi", "yes", "no", "please", "book", "appointment", "doctor", "slot"}
         if not any(w.lower() in stopwords for w in words):
             return text.strip().title()
-
     return None
 
 
@@ -229,32 +441,40 @@ def extract_name(text: str, current_name: Optional[str] = None) -> Optional[str]
 # 4. Multi-Turn Conversational Voice Assistant
 # ==========================================
 @router.post("/chat", response_model=RetellChatResponse)
-def retell_chat_conversation(
+async def retell_chat_conversation(
     req: RetellChatRequest,
     db: Session = Depends(get_db)
 ):
     """
-    Intelligent, context-aware conversational loop that remembers history,
-    answers open-ended questions, asks relevant follow-up questions,
-    and guides the user all the way to a confirmed database booking.
+    Intelligent conversational voice assistant with Gemini AI capability
+    and built-in conversational memory across all dialogue turns.
     """
     msg = req.user_message.strip()
     msg_lower = msg.lower()
     state = req.state.model_copy() if req.state else RetellConversationState()
     doctors = crud.get_doctors(db=db)
 
-    # 1. Update Memory Entities across the message
-    # Email
+    # 1. Check if Gemini API Key is available
+    api_key = req.api_key or os.getenv("GEMINI_API_KEY")
+    if api_key and api_key.strip():
+        gemini_result = await call_gemini_api(msg, req.history or [], api_key.strip(), db)
+        if gemini_result and gemini_result.get("text"):
+            return RetellChatResponse(
+                ai_response=gemini_result["text"],
+                next_state=state,
+                booking_reference=gemini_result.get("booking_reference"),
+                powered_by="gemini"
+            )
+
+    # 2. Built-in Entity Memory Tracker (Remembers details across all turns)
     email_found = extract_email(msg)
     if email_found:
         state.patient_email = email_found
 
-    # Phone
     phone_found = extract_phone(msg)
     if phone_found:
         state.patient_phone = phone_found
 
-    # Name
     name_found = extract_name(msg, state.patient_name)
     if name_found and not state.patient_name:
         state.patient_name = name_found
@@ -290,7 +510,6 @@ def retell_chat_conversation(
             state.specialty = "General Practice"
 
     # Match slot selection
-    # Check if user mentioned an exact slot ID or time (e.g. "Slot 14", "9:00 AM", "morning", "first one")
     available_slots = crud.get_available_slots(db=db, doctor_id=state.doctor_id)
     if state.specialty and not state.doctor_id:
         available_slots = [s for s in available_slots if s.doctor and state.specialty.lower() in s.doctor.specialty.lower()]
@@ -306,11 +525,11 @@ def retell_chat_conversation(
                 break
 
     if not slot_match and available_slots:
-        if "first" in msg_lower or "earliest" in msg_lower or "1st" in msg_lower:
+        if any(w in msg_lower for w in ["first", "earliest", "1st"]):
             slot_match = available_slots[0]
-        elif "second" in msg_lower or "2nd" in msg_lower and len(available_slots) > 1:
+        elif any(w in msg_lower for w in ["second", "2nd"]) and len(available_slots) > 1:
             slot_match = available_slots[1]
-        elif "third" in msg_lower or "3rd" in msg_lower and len(available_slots) > 2:
+        elif any(w in msg_lower for w in ["third", "3rd"]) and len(available_slots) > 2:
             slot_match = available_slots[2]
 
     if slot_match:
@@ -321,7 +540,7 @@ def retell_chat_conversation(
             state.specialty = slot_match.doctor.specialty
             state.doctor_id = slot_match.doctor.id
 
-    # 2. Check if user is asking general informational questions
+    # 3. Informational inquiries
     if any(q in msg_lower for q in ["who are the doctors", "list doctors", "what doctors", "available doctors", "show doctors"]):
         doc_summaries = [f"{d.name} ({d.specialty} - {d.qualification})" for d in doctors]
         reply = (
@@ -338,7 +557,7 @@ def retell_chat_conversation(
                 next_state=state
             )
 
-    # 3. Check for Reference Code lookup (e.g. "My reference is MV-123456")
+    # 4. Check for Reference Code lookup
     ref_match = re.search(r"MV-[A-Z0-9]{6}", msg.upper())
     if ref_match:
         ref_code = ref_match.group(0)
@@ -347,12 +566,11 @@ def retell_chat_conversation(
             time_str = booking.slot.start_time.strftime("%A, %B %d at %I:%M %p")
             doc_str = booking.slot.doctor.name if booking.slot and booking.slot.doctor else "Doctor"
             return RetellChatResponse(
-                ai_response=f"I found your booking {ref_code}! You are scheduled with {doc_str} on {time_str} (Status: {booking.status}). Would you like to keep or reschedule this?",
+                ai_response=f"I found your booking {ref_code}! You are scheduled with {doc_str} on {time_str} (Status: {booking.status}).",
                 next_state=state
             )
 
-    # 4. Step Progression & Next Follow-Up Question
-    # Check if we are ready to book (we have: slot_id, patient_name, phone, email)
+    # 5. Progressive Follow-Up & Dynamic Booking
     if state.slot_id and state.patient_name and state.patient_phone and state.patient_email:
         try:
             booking_in = schemas.BookingCreateRequest(
@@ -370,8 +588,7 @@ def retell_chat_conversation(
                 f"You're all booked, {booking.patient_name}! "
                 f"Your appointment with {state.doctor_name or 'your doctor'} on {state.slot_time_str} is officially confirmed. "
                 f"Your reference confirmation code is {booking.reference_code}. "
-                f"A full confirmation notice has been dispatched to {booking.patient_email}. "
-                "Is there anything else I can assist you with today?"
+                f"A full confirmation notice has been dispatched to {booking.patient_email}."
             )
             return RetellChatResponse(
                 ai_response=final_reply,
@@ -385,7 +602,7 @@ def retell_chat_conversation(
                 next_state=state
             )
 
-    # Missing Contact info (Phone or Email)
+    # Missing Contact info
     if state.slot_id and state.patient_name:
         state.step = "COLLECT_CONTACT"
         missing = []
@@ -402,7 +619,7 @@ def retell_chat_conversation(
     if state.slot_id and not state.patient_name:
         state.step = "COLLECT_NAME"
         return RetellChatResponse(
-            ai_response=f"Perfect! I have held {state.slot_time_str} with {state.doctor_name}. May I have your full legal name for the patient record?",
+            ai_response=f"Perfect! I have held {state.slot_time_str} with {state.doctor_name}. May I have your full legal name please?",
             next_state=state
         )
 
@@ -437,12 +654,11 @@ def retell_chat_conversation(
             available_slots=formatted_slots
         )
 
-    # Initial or Fallback: Ask for Specialty or Symptoms
+    # Initial or Fallback
     state.step = "COLLECT_SPECIALTY"
     specs_list = sorted(list({d.specialty for d in doctors if d.specialty}))
     specs_str = ", ".join(specs_list) if specs_list else "Cardiology, Dermatology, Pediatrics, and General Practice"
-    
-    # Context-aware response instead of static repetition
+
     if any(g in msg_lower for g in ["hi", "hello", "hey", "good morning", "good evening"]):
         greeting_reply = (
             f"Hello! I am your MediVoice AI appointment assistant. "

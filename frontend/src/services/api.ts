@@ -83,17 +83,19 @@ export interface RetellChatResponse {
     formatted_time: string;
   }>;
   booking_reference?: string;
+  powered_by?: string;
 }
 
 export async function sendRetellChatMessage(
   userMessage: string,
   state?: RetellChatState,
-  history?: Array<{ role: string; content: string }>
+  history?: Array<{ role: string; content: string }>,
+  apiKey?: string
 ): Promise<RetellChatResponse> {
   const res = await fetch(`${API_BASE}/retell/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ user_message: userMessage, state, history }),
+    body: JSON.stringify({ user_message: userMessage, state, history, api_key: apiKey }),
   });
   const data = await res.json();
   if (!res.ok) {

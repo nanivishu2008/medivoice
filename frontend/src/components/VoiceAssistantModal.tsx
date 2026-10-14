@@ -25,6 +25,9 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [availableSlots, setAvailableSlots] = useState<Array<{ slot_id: number; doctor_name: string; formatted_time: string }>>([]);
   const [confirmedRef, setConfirmedRef] = useState<string | null>(null);
+  const [geminiKey, setGeminiKey] = useState<string>(() => localStorage.getItem('gemini_api_key') || '');
+  const [showKeyInput, setShowKeyInput] = useState(false);
+  const [poweredBy, setPoweredBy] = useState<string>(geminiKey ? 'gemini' : 'built-in');
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const recognitionRef = useRef<any>(null);
@@ -134,10 +137,11 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({
         content: m.text
       }));
 
-      const res = await sendRetellChatMessage(userText, state, historyPayload);
+      const res = await sendRetellChatMessage(userText, state, historyPayload, geminiKey || undefined);
       setMessages([...updatedMessages, { sender: 'ai', text: res.ai_response }]);
       setState(res.next_state);
       setAvailableSlots(res.available_slots || []);
+      if (res.powered_by) setPoweredBy(res.powered_by);
 
       if (res.booking_reference) {
         setConfirmedRef(res.booking_reference);
@@ -203,11 +207,30 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({
           </div>
           <div>
             <div style={{ fontWeight: 700, fontSize: '0.95rem' }}>MediVoice AI Assistant</div>
-            <div style={{ fontSize: '0.75rem', opacity: 0.9 }}>Interactive Voice Scheduler</div>
+            <div style={{ fontSize: '0.75rem', opacity: 0.9 }}>
+              {poweredBy === 'gemini' ? '⚡ Powered by Gemini 2.0' : 'Interactive Voice Scheduler'}
+            </div>
           </div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+          <button
+            type="button"
+            title="Configure Gemini API Key"
+            onClick={() => setShowKeyInput(!showKeyInput)}
+            style={{
+              background: geminiKey ? '#15803d' : 'rgba(255, 255, 255, 0.2)',
+              border: 'none',
+              color: 'white',
+              borderRadius: '8px',
+              padding: '0.35rem 0.6rem',
+              cursor: 'pointer',
+              fontSize: '0.8rem',
+              fontWeight: 600,
+            }}
+          >
+            {geminiKey ? '⚡ Gemini Active' : '⚙️ Gemini Key'}
+          </button>
           <button
             type="button"
             title={voiceEnabled ? "Mute AI Voice" : "Enable AI Voice"}
@@ -240,6 +263,55 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Optional Gemini API Key Drawer */}
+      {showKeyInput && (
+        <div style={{
+          background: '#f1f5f9',
+          padding: '0.75rem 1rem',
+          borderBottom: '1px solid #e2e8f0',
+          fontSize: '0.85rem',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.35rem' }}>
+            <strong>Google Gemini API Key:</strong>
+            <a
+              href="https://aistudio.google.com/app/apikey"
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: '#0284c7', textDecoration: 'none' }}
+            >
+              Get Free Key ↗
+            </a>
+          </div>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            <input
+              type="password"
+              placeholder="Paste AI Studio API Key..."
+              value={geminiKey}
+              onChange={(e) => {
+                const val = e.target.value;
+                setGeminiKey(val);
+                localStorage.setItem('gemini_api_key', val);
+              }}
+              className="form-input"
+              style={{ padding: '0.4rem 0.6rem', fontSize: '0.85rem' }}
+            />
+            {geminiKey && (
+              <button
+                type="button"
+                onClick={() => {
+                  setGeminiKey('');
+                  localStorage.removeItem('gemini_api_key');
+                }}
+                className="btn-danger"
+                style={{ padding: '0.35rem 0.6rem', fontSize: '0.75rem', whiteSpace: 'nowrap' }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Chat Messages */}
       <div style={{
