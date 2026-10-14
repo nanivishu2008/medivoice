@@ -5,9 +5,11 @@ import { DoctorList } from './components/DoctorList';
 import { SlotPicker } from './components/SlotPicker';
 import { BookingForm } from './components/BookingForm';
 import { BookingLookup } from './components/BookingLookup';
+import { VoiceAssistantModal } from './components/VoiceAssistantModal';
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'book' | 'lookup'>('book');
+  const [isVoiceOpen, setIsVoiceOpen] = useState(false);
 
   // Doctors & Specialties
   const [doctors, setDoctors] = useState<Doctor[]>([]);
@@ -135,6 +137,12 @@ export const App: React.FC = () => {
             >
               🔍 Find Booking
             </button>
+            <button
+              className="nav-btn-highlight"
+              onClick={() => setIsVoiceOpen(true)}
+            >
+              🎙️ Voice Assistant
+            </button>
           </nav>
         </div>
       </header>
@@ -189,6 +197,30 @@ export const App: React.FC = () => {
           <BookingLookup />
         )}
       </main>
+
+      {/* Floating Interactive Voice Assistant Button */}
+      {!isVoiceOpen && (
+        <button
+          className="floating-voice-btn"
+          onClick={() => setIsVoiceOpen(true)}
+          title="Start voice conversation to book an appointment"
+        >
+          <span className="pulse-dot"></span>
+          <span>🎙️ Talk to AI Assistant</span>
+        </button>
+      )}
+
+      {/* Voice Assistant Modal */}
+      <VoiceAssistantModal
+        isOpen={isVoiceOpen}
+        onClose={() => setIsVoiceOpen(false)}
+        onBookingCreated={async () => {
+          if (selectedDoctorId) {
+            const refreshed = await fetchSlots(selectedDoctorId);
+            setSlots(refreshed);
+          }
+        }}
+      />
     </div>
   );
 };

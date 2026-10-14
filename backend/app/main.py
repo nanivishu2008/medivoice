@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .database import engine, Base
 from .seed_data import seed_database
-from .routers import doctors, slots, bookings
+from .routers import doctors, slots, bookings, retell
 
 
 @asynccontextmanager
@@ -34,6 +34,7 @@ app.add_middleware(
 app.include_router(doctors.router)
 app.include_router(slots.router)
 app.include_router(bookings.router)
+app.include_router(retell.router)
 
 
 @app.get("/", tags=["Health"])

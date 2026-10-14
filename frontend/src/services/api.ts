@@ -59,3 +59,45 @@ export async function cancelBooking(referenceCode: string): Promise<Booking> {
   }
   return data;
 }
+
+export interface RetellChatState {
+  step: string;
+  specialty?: string;
+  doctor_id?: number;
+  doctor_name?: string;
+  slot_id?: number;
+  slot_time_str?: string;
+  patient_name?: string;
+  patient_phone?: string;
+  patient_email?: string;
+  reason?: string;
+}
+
+export interface RetellChatResponse {
+  ai_response: string;
+  next_state: RetellChatState;
+  available_slots?: Array<{
+    slot_id: number;
+    doctor_name: string;
+    start_time: string;
+    formatted_time: string;
+  }>;
+  booking_reference?: string;
+}
+
+export async function sendRetellChatMessage(
+  userMessage: string,
+  state?: RetellChatState
+): Promise<RetellChatResponse> {
+  const res = await fetch(`${API_BASE}/retell/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_message: userMessage, state }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.detail || `Voice chat request failed (${res.status})`);
+  }
+  return data;
+}
+
