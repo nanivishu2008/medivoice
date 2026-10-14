@@ -129,7 +129,12 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({
     setLoading(true);
 
     try {
-      const res = await sendRetellChatMessage(userText, state);
+      const historyPayload = messages.map(m => ({
+        role: m.sender === 'user' ? 'user' : 'assistant',
+        content: m.text
+      }));
+
+      const res = await sendRetellChatMessage(userText, state, historyPayload);
       setMessages([...updatedMessages, { sender: 'ai', text: res.ai_response }]);
       setState(res.next_state);
       setAvailableSlots(res.available_slots || []);
